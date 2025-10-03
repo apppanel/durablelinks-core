@@ -2,13 +2,12 @@ package repository
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"fmt"
 
 	"github.com/apppanel/durablelinks-core/models"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"gorm.io/gorm"
 )
 
 type LinkRepository interface {
@@ -18,10 +17,10 @@ type LinkRepository interface {
 }
 
 type linkRepository struct {
-	db *sql.DB
+	db *gorm.DB
 }
 
-func NewLinkRepository(db *sql.DB) LinkRepository {
+func NewLinkRepository(db *gorm.DB) LinkRepository {
 	return &linkRepository{
 		db: db,
 	}
@@ -30,48 +29,17 @@ func NewLinkRepository(db *sql.DB) LinkRepository {
 func (r *linkRepository) GetLinkByHostAndPath(ctx context.Context, host, path string, projectID *uuid.UUID) (*models.DurableLink, error) {
 	var dbLink models.DurableLinkDB
 
-	query := `SELECT * FROM apppanel_durable_links WHERE host = $1 AND path = $2`
-	args := []interface{}{host, path}
+	query := r.db.WithContext(ctx).Where("host = ? AND path = ?", host, path)
 
 	if projectID != nil {
-		query += ` AND project_id = $3`
-		args = append(args, projectID.String())
+		projectIDStr := projectID.String()
+		query = query.Where("project_id = ?", projectIDStr)
 	}
 
-	row := r.db.QueryRowContext(ctx, query, args...)
-	err := row.Scan(
-		&dbLink.ID,
-		&dbLink.Host,
-		&dbLink.Path,
-		&dbLink.Link,
-		&dbLink.IsUnguessablePath,
-		&dbLink.ProjectID,
-		&dbLink.AndroidPackageName,
-		&dbLink.AndroidFallbackLink,
-		&dbLink.AndroidMinVersion,
-		&dbLink.IOSFallbackLink,
-		&dbLink.IOSIpadFallbackLink,
-		&dbLink.IOSAppStoreID,
-		&dbLink.SocialTitle,
-		&dbLink.SocialDescription,
-		&dbLink.SocialImageLink,
-		&dbLink.UtmSource,
-		&dbLink.UtmMedium,
-		&dbLink.UtmCampaign,
-		&dbLink.UtmTerm,
-		&dbLink.UtmContent,
-		&dbLink.ItunesPt,
-		&dbLink.ItunesAt,
-		&dbLink.ItunesCt,
-		&dbLink.ItunesMt,
-		&dbLink.OtherFallbackURL,
-		&dbLink.ParamsHash,
-		&dbLink.CreatedAt,
-		&dbLink.UpdatedAt,
-	)
+	err := query.First(&dbLink).Error
 
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Debug().
 				Str("host", host).
 				Str("path", path).
@@ -83,7 +51,7 @@ func (r *linkRepository) GetLinkByHostAndPath(ctx context.Context, host, path st
 			Str("host", host).
 			Str("path", path).
 			Msg("Failed to retrieve link from database")
-		return nil, fmt.Errorf("database error: %w", err)
+		return nil, err
 	}
 
 	dl := dbLink.ToDurableLink()
@@ -91,81 +59,37 @@ func (r *linkRepository) GetLinkByHostAndPath(ctx context.Context, host, path st
 }
 
 func (r *linkRepository) FindExistingShortLink(ctx context.Context, host string, link *models.DurableLink, projectID *uuid.UUID) (string, error) {
-	var path string
+	var result struct {
+		Path string
+	}
+
 	dbLink := models.FromDurableLink(*link, "", "", false, nil)
 	paramsHash := dbLink.ComputeParamsHash()
-	query := `
-		SELECT path FROM apppanel_durable_links
-		WHERE host = $1
-		AND link = $2
-		AND params_hash = $3
-		AND is_unguessable_path = FALSE
-	`
-	args := []interface{}{host, link.Link, paramsHash}
+
+	query := r.db.WithContext(ctx).
+		Model(&models.DurableLinkDB{}).
+		Select("path").
+		Where("host = ?", host).
+		Where("link = ?", link.Link).
+		Where("params_hash = ?", paramsHash).
+		Where("is_unguessable_path = ?", false)
 
 	if projectID != nil {
-		query += ` AND project_id = $4`
-		args = append(args, projectID.String())
+		projectIDStr := projectID.String()
+		query = query.Where("project_id = ?", projectIDStr)
 	} else {
-		query += ` AND project_id IS NULL`
+		query = query.Where("project_id IS NULL")
 	}
-	query += ` LIMIT 1`
-	err := r.db.QueryRowContext(ctx, query, args...).Scan(&path)
-	return path, err
+
+	err := query.Limit(1).First(&result).Error
+	return result.Path, err
 }
 
 func (r *linkRepository) CreateShortLink(ctx context.Context, link *models.DurableLinkDB, projectID *uuid.UUID) error {
-	query := `
-		INSERT INTO apppanel_durable_links (
-			host, path, link, is_unguessable_path, project_id,
-			android_package_name, android_fallback_link, android_min_version,
-			ios_fallback_link, ios_ipad_fallback_link, ios_app_store_id,
-			social_title, social_description, social_image_link,
-			utm_source, utm_medium, utm_campaign, utm_term, utm_content,
-			itunes_pt, itunes_at, itunes_ct, itunes_mt,
-			other_fallback_url, params_hash
-		) VALUES (
-			$1, $2, $3, $4, $5,
-			$6, $7, $8,
-			$9, $10, $11,
-			$12, $13, $14,
-			$15, $16, $17, $18, $19,
-			$20, $21, $22, $23,
-			$24, $25
-		)`
-
-	var projectIDStr *string
 	if projectID != nil {
-		s := projectID.String()
-		projectIDStr = &s
+		projectIDStr := projectID.String()
+		link.ProjectID = &projectIDStr
 	}
 
-	_, err := r.db.ExecContext(ctx, query,
-		link.Host,
-		link.Path,
-		link.Link,
-		link.IsUnguessablePath,
-		projectIDStr,
-		link.AndroidPackageName,
-		link.AndroidFallbackLink,
-		link.AndroidMinVersion,
-		link.IOSFallbackLink,
-		link.IOSIpadFallbackLink,
-		link.IOSAppStoreID,
-		link.SocialTitle,
-		link.SocialDescription,
-		link.SocialImageLink,
-		link.UtmSource,
-		link.UtmMedium,
-		link.UtmCampaign,
-		link.UtmTerm,
-		link.UtmContent,
-		link.ItunesPt,
-		link.ItunesAt,
-		link.ItunesCt,
-		link.ItunesMt,
-		link.OtherFallbackURL,
-		link.ParamsHash,
-	)
-	return err
+	return r.db.WithContext(ctx).Create(link).Error
 }

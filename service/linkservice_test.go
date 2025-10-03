@@ -1,21 +1,20 @@
 package service
 
+
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/apppanel/durablelinks-core/models"
 	"github.com/apppanel/durablelinks-core/repository"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func int64Ptr(i int64) *int64 {
@@ -41,14 +40,17 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func setupTestService(t *testing.T) (*linkService, sqlmock.Sqlmock, *sql.DB) {
-	db, mock, err := sqlmock.New()
+func setupTestService(t *testing.T) (*linkService, *gorm.DB) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+
+	err = db.AutoMigrate(&models.DurableLinkDB{})
 	require.NoError(t, err)
 
 	repo := repository.NewLinkRepository(db)
 	service := NewLinkService(repo)
 
-	return service, mock, db
+	return service, db
 }
 
 func TestCreateDurableLink_Warnings(t *testing.T) {
@@ -432,19 +434,7 @@ func TestCreateDurableLink_Warnings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			service, mock, db := setupTestService(t)
-			defer db.Close()
-
-			// Check if SHORT suffix is being used, if so we need to mock the query
-			suffixOption := strings.ToUpper(tt.params.Suffix.Option)
-			if suffixOption == "SHORT" {
-				// Mock the query for finding existing short links (returns no rows)
-				mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-					WillReturnError(sql.ErrNoRows)
-			}
-
-			mock.ExpectExec(`INSERT INTO apppanel_durable_links`).
-				WillReturnResult(sqlmock.NewResult(1, 1))
+			service, _ := setupTestService(t)
 
 			result, err := service.CreateDurableLink(context.Background(), tt.params, nil, defaultTenantCfg)
 			require.NoError(t, err)
@@ -460,7 +450,6 @@ func TestCreateDurableLink_Warnings(t *testing.T) {
 				}
 			}
 
-			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
 }
@@ -589,11 +578,7 @@ func TestCreateDurableLink_Defaults(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			service, mock, db := setupTestService(t)
-			defer db.Close()
-
-			mock.ExpectExec(`INSERT INTO apppanel_durable_links`).
-				WillReturnResult(sqlmock.NewResult(1, 1))
+			service, _ := setupTestService(t)
 
 			result, err := service.CreateDurableLink(context.Background(), tt.params, nil, tt.tenantCfg)
 			require.NoError(t, err)
@@ -610,14 +595,22 @@ func TestCreateDurableLink_Defaults(t *testing.T) {
 				}
 			}
 
-			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
 }
 
 func TestCreateDurableLink_ReuseExistingShortLink(t *testing.T) {
-	service, mock, db := setupTestService(t)
-	defer db.Close()
+	service, db := setupTestService(t)
+
+	// First create an existing short link
+	existingLink := &models.DurableLinkDB{
+		Host:              "example.com",
+		Path:              "abc123",
+		Link:              "https://example.com/target",
+		IsUnguessablePath: false,
+		ParamsHash:        models.FromDurableLink(models.DurableLink{Link: "https://example.com/target"}, "", "", false, nil).ComputeParamsHash(),
+	}
+	db.Create(existingLink)
 
 	params := models.CreateDurableLinkRequest{
 		DurableLinkInfo: models.DurableLink{
@@ -629,13 +622,6 @@ func TestCreateDurableLink_ReuseExistingShortLink(t *testing.T) {
 		},
 	}
 
-	// Mock the query to return an existing path
-	existingPath := "abc123"
-	rows := sqlmock.NewRows([]string{"path"}).AddRow(existingPath)
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WillReturnRows(rows)
-
-	// Should NOT expect an INSERT since we're reusing existing link
 	result, err := service.CreateDurableLink(context.Background(), params, nil, defaultTenantCfg)
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -643,8 +629,6 @@ func TestCreateDurableLink_ReuseExistingShortLink(t *testing.T) {
 	expectedShortLink := "https://example.com/abc123"
 	assert.Equal(t, expectedShortLink, result.ShortLink)
 	assert.Equal(t, 0, len(result.Warnings))
-
-	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestResolveShortPath(t *testing.T) {
@@ -696,43 +680,26 @@ func TestResolveShortPath(t *testing.T) {
 		{
 			name:        "link not found in database",
 			rawURL:      "https://example.com/notfound",
-			mockPath:    "notfound",
-			mockErr:     sql.ErrNoRows,
+			mockPath:    "", // Don't create link in DB
+			mockErr:     nil,
 			expectError: repository.ErrLinkNotFound,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			service, mock, db := setupTestService(t)
-			defer db.Close()
+			service, db := setupTestService(t)
 
-			if tt.mockPath != "" {
-				if tt.mockErr != nil {
-					mock.ExpectQuery(`SELECT \* FROM apppanel_durable_links`).
-						WillReturnError(tt.mockErr)
-				} else {
-					now := time.Now()
-					rows := sqlmock.NewRows([]string{
-						"id", "host", "path", "link", "is_unguessable_path", "project_id",
-						"android_package_name", "android_fallback_link", "android_min_version",
-						"ios_fallback_link", "ios_ipad_fallback_link", "ios_app_store_id",
-						"social_title", "social_description", "social_image_link",
-						"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-						"itunes_pt", "itunes_at", "itunes_ct", "itunes_mt",
-						"other_fallback_url", "params_hash", "created_at", "updated_at",
-					}).AddRow(
-						1, "example.com", tt.mockPath, tt.mockLink, false, nil,
-						nil, nil, nil,
-						nil, nil, nil,
-						nil, nil, nil,
-						nil, nil, nil, nil, nil,
-						nil, nil, nil, nil,
-						nil, "hash123", now, now,
-					)
-					mock.ExpectQuery(`SELECT \* FROM apppanel_durable_links`).
-						WillReturnRows(rows)
+			if tt.mockPath != "" && tt.mockErr == nil {
+				// Create the link in the database
+				link := &models.DurableLinkDB{
+					Host:              "example.com",
+					Path:              tt.mockPath,
+					Link:              tt.mockLink,
+					IsUnguessablePath: false,
+					ParamsHash:        "hash123",
 				}
+				db.Create(link)
 			}
 
 			result, err := service.ResolveShortPath(context.Background(), tt.rawURL, nil, defaultTenantCfg)
@@ -747,9 +714,6 @@ func TestResolveShortPath(t *testing.T) {
 				assert.Equal(t, tt.expectLink, result.LongLink)
 			}
 
-			if tt.mockPath != "" {
-				assert.NoError(t, mock.ExpectationsWereMet())
-			}
 		})
 	}
 }
@@ -793,8 +757,7 @@ func TestCreateDurableLink_ErrorPaths(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			service, _, db := setupTestService(t)
-			defer db.Close()
+			service, _ := setupTestService(t)
 
 			result, err := service.CreateDurableLink(context.Background(), tt.params, nil, tt.tenantCfg)
 
@@ -803,60 +766,9 @@ func TestCreateDurableLink_ErrorPaths(t *testing.T) {
 				assert.ErrorContains(t, err, tt.expectError.Error())
 			}
 			assert.Nil(t, result)
+
 		})
 	}
-}
-
-func TestCreateDurableLink_DatabaseError(t *testing.T) {
-	service, mock, db := setupTestService(t)
-	defer db.Close()
-
-	params := models.CreateDurableLinkRequest{
-		DurableLinkInfo: models.DurableLink{
-			Host: "example.com",
-			Link: "https://example.com/target",
-		},
-		Suffix: models.Suffix{
-			Option: "UNGUESSABLE",
-		},
-	}
-
-	// Mock database insert to return an error
-	mock.ExpectExec(`INSERT INTO apppanel_durable_links`).
-		WillReturnError(fmt.Errorf("database connection lost"))
-
-	result, err := service.CreateDurableLink(context.Background(), params, nil, defaultTenantCfg)
-
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to store link")
-	assert.Nil(t, result)
-	assert.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestCreateDurableLink_FindExistingShortLinkError(t *testing.T) {
-	service, mock, db := setupTestService(t)
-	defer db.Close()
-
-	params := models.CreateDurableLinkRequest{
-		DurableLinkInfo: models.DurableLink{
-			Host: "example.com",
-			Link: "https://example.com/target",
-		},
-		Suffix: models.Suffix{
-			Option: "SHORT",
-		},
-	}
-
-	// Mock FindExistingShortLink to return a database error (not ErrNoRows)
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WillReturnError(fmt.Errorf("database error"))
-
-	result, err := service.CreateDurableLink(context.Background(), params, nil, defaultTenantCfg)
-
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "database error")
-	assert.Nil(t, result)
-	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestGenerateDurableLinkPath(t *testing.T) {

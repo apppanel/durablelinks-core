@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/rs/zerolog/log"
+	"gorm.io/gorm"
 )
 
 type TenantConfig struct {
@@ -198,7 +199,7 @@ func (s *linkService) createOrGetShortLink(
 				Msg("Re-using existing short link")
 			return &models.ShortLinkResponse{ShortLink: full, Warnings: []models.Warning{}}, nil
 
-		} else if err != sql.ErrNoRows {
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Error().
 				Err(err).
 				Msg("Error querying for existing short link")

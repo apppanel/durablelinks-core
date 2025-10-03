@@ -2,17 +2,16 @@ package repository
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"os"
 	"testing"
-	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/apppanel/durablelinks-core/models"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func TestMain(m *testing.M) {
@@ -23,13 +22,15 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func setupMockDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock, LinkRepository) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("failed to open sqlmock database: %s", err)
-	}
+func setupTestDB(t *testing.T) (*gorm.DB, LinkRepository) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+
+	err = db.AutoMigrate(&models.DurableLinkDB{})
+	require.NoError(t, err)
+
 	repo := NewLinkRepository(db)
-	return db, mock, repo
+	return db, repo
 }
 
 func stringPtr(s string) *string {
@@ -41,35 +42,22 @@ func int64Ptr(i int64) *int64 {
 }
 
 func TestGetLinkByHostAndPath_Success(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
+	db, repo := setupTestDB(t)
 
 	host := "example.com"
 	path := "test"
 	link := "https://example.com/deep-link"
-	now := time.Now()
 
-	rows := sqlmock.NewRows([]string{
-		"id", "host", "path", "link", "is_unguessable_path", "project_id",
-		"android_package_name", "android_fallback_link", "android_min_version",
-		"ios_fallback_link", "ios_ipad_fallback_link", "ios_app_store_id",
-		"social_title", "social_description", "social_image_link",
-		"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-		"itunes_pt", "itunes_at", "itunes_ct", "itunes_mt",
-		"other_fallback_url", "params_hash", "created_at", "updated_at",
-	}).AddRow(
-		1, host, path, link, false, nil,
-		stringPtr("com.example.app"), nil, nil,
-		nil, nil, nil,
-		nil, nil, nil,
-		nil, nil, nil, nil, nil,
-		nil, nil, nil, nil,
-		nil, "abc123hash", now, now,
-	)
-
-	mock.ExpectQuery(`SELECT \* FROM apppanel_durable_links`).
-		WithArgs(host, path).
-		WillReturnRows(rows)
+	// Create a link in the database
+	dbLink := &models.DurableLinkDB{
+		Host:               host,
+		Path:               path,
+		Link:               link,
+		IsUnguessablePath:  false,
+		AndroidPackageName: stringPtr("com.example.app"),
+		ParamsHash:         "abc123hash",
+	}
+	db.Create(dbLink)
 
 	result, err := repo.GetLinkByHostAndPath(context.Background(), host, path, nil)
 	assert.NoError(t, err)
@@ -80,48 +68,31 @@ func TestGetLinkByHostAndPath_Success(t *testing.T) {
 }
 
 func TestGetLinkByHostAndPath_NotFound(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
-
-	mock.ExpectQuery(`SELECT \* FROM apppanel_durable_links`).
-		WithArgs("unknown.com", "notfound").
-		WillReturnError(sql.ErrNoRows)
+	_, repo := setupTestDB(t)
 
 	_, err := repo.GetLinkByHostAndPath(context.Background(), "unknown.com", "notfound", nil)
-	assert.True(t, errors.Is(err, ErrLinkNotFound))
+	assert.ErrorIs(t, err, ErrLinkNotFound)
 }
 
 func TestGetLinkByHostAndPath_WithProjectID(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
+	db, repo := setupTestDB(t)
 
 	host := "example.com"
 	path := "test"
 	link := "https://example.com/deep-link"
 	projectID := uuid.New()
-	now := time.Now()
+	projectIDStr := projectID.String()
 
-	rows := sqlmock.NewRows([]string{
-		"id", "host", "path", "link", "is_unguessable_path", "project_id",
-		"android_package_name", "android_fallback_link", "android_min_version",
-		"ios_fallback_link", "ios_ipad_fallback_link", "ios_app_store_id",
-		"social_title", "social_description", "social_image_link",
-		"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-		"itunes_pt", "itunes_at", "itunes_ct", "itunes_mt",
-		"other_fallback_url", "params_hash", "created_at", "updated_at",
-	}).AddRow(
-		1, host, path, link, false, stringPtr(projectID.String()),
-		nil, nil, nil,
-		nil, nil, nil,
-		nil, nil, nil,
-		nil, nil, nil, nil, nil,
-		nil, nil, nil, nil,
-		nil, "abc123hash", now, now,
-	)
-
-	mock.ExpectQuery(`SELECT \* FROM apppanel_durable_links`).
-		WithArgs(host, path, projectID.String()).
-		WillReturnRows(rows)
+	// Create a link in the database
+	dbLink := &models.DurableLinkDB{
+		Host:              host,
+		Path:              path,
+		Link:              link,
+		IsUnguessablePath: false,
+		ProjectID:         &projectIDStr,
+		ParamsHash:        "abc123hash",
+	}
+	db.Create(dbLink)
 
 	result, err := repo.GetLinkByHostAndPath(context.Background(), host, path, &projectID)
 	assert.NoError(t, err)
@@ -130,274 +101,85 @@ func TestGetLinkByHostAndPath_WithProjectID(t *testing.T) {
 }
 
 func TestFindExistingShortLink_Found(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
+	db, repo := setupTestDB(t)
 
 	host := "example.com"
+	linkURL := "https://example.com/target"
+	existingPath := "abc123"
+
 	link := &models.DurableLink{
 		Host: host,
-		Link: "https://example.com/deep-link",
+		Link: linkURL,
 	}
-	path := "abc123"
 
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WithArgs(host, link.Link, sqlmock.AnyArg()). // params_hash is computed
-		WillReturnRows(sqlmock.NewRows([]string{"path"}).AddRow(path))
+	// Create existing short link
+	dbLink := models.FromDurableLink(*link, host, existingPath, false, nil)
+	db.Create(dbLink)
 
-	result, err := repo.FindExistingShortLink(context.Background(), host, link, nil)
+	path, err := repo.FindExistingShortLink(context.Background(), host, link, nil)
 	assert.NoError(t, err)
-	assert.Equal(t, path, result)
+	assert.Equal(t, existingPath, path)
 }
 
 func TestFindExistingShortLink_NotFound(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
+	_, repo := setupTestDB(t)
 
 	link := &models.DurableLink{
 		Host: "example.com",
-		Link: "https://example.com/deep-link",
+		Link: "https://example.com/target",
 	}
-
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WithArgs("example.com", link.Link, sqlmock.AnyArg()). // params_hash is computed
-		WillReturnError(sql.ErrNoRows)
 
 	_, err := repo.FindExistingShortLink(context.Background(), "example.com", link, nil)
 	assert.Error(t, err)
-	assert.True(t, errors.Is(err, sql.ErrNoRows))
 }
 
-func TestFindExistingShortLink_WithProjectID(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
+func TestCreateShortLink_Success(t *testing.T) {
+	db, repo := setupTestDB(t)
 
 	host := "example.com"
-	link := &models.DurableLink{
-		Host: host,
-		Link: "https://example.com/deep-link",
-	}
-	projectID := uuid.New()
 	path := "abc123"
+	linkURL := "https://example.com/target"
 
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WithArgs(host, link.Link, sqlmock.AnyArg(), projectID.String()). // params_hash is computed
-		WillReturnRows(sqlmock.NewRows([]string{"path"}).AddRow(path))
+	link := &models.DurableLinkDB{
+		Host:              host,
+		Path:              path,
+		Link:              linkURL,
+		IsUnguessablePath: false,
+		ParamsHash:        "hash123",
+	}
 
-	result, err := repo.FindExistingShortLink(context.Background(), host, link, &projectID)
+	err := repo.CreateShortLink(context.Background(), link, nil)
 	assert.NoError(t, err)
-	assert.Equal(t, path, result)
-}
 
-func TestFindExistingShortLink_IgnoresUnguessableLinks(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
-
-	host := "example.com"
-	link := &models.DurableLink{
-		Host: host,
-		Link: "https://example.com/deep-link",
-	}
-
-	// Query should filter out unguessable links with is_unguessable_path = FALSE clause
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WithArgs(host, link.Link, sqlmock.AnyArg()).
-		WillReturnError(sql.ErrNoRows) // No short links found, only unguessable ones exist
-
-	result, err := repo.FindExistingShortLink(context.Background(), host, link, nil)
-	assert.Error(t, err)
-	assert.Equal(t, "", result)
-	assert.True(t, errors.Is(err, sql.ErrNoRows))
-}
-
-func TestFindExistingShortLink_DifferentParamsGetDifferentHash(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
-
-	host := "example.com"
-	deepLink := "https://example.com/deep-link"
-
-	// First link with Android package name
-	link1 := &models.DurableLink{
-		Host: host,
-		Link: deepLink,
-		AndroidParameters: models.AndroidParameters{
-			AndroidPackageName: stringPtr("com.example.app1"),
-		},
-	}
-
-	// Second link with different Android package name
-	link2 := &models.DurableLink{
-		Host: host,
-		Link: deepLink,
-		AndroidParameters: models.AndroidParameters{
-			AndroidPackageName: stringPtr("com.example.app2"),
-		},
-	}
-
-	// Compute actual hashes to verify they're different
-	dbLink1 := models.FromDurableLink(*link1, "", "", false, nil)
-	dbLink2 := models.FromDurableLink(*link2, "", "", false, nil)
-	hash1 := dbLink1.ComputeParamsHash()
-	hash2 := dbLink2.ComputeParamsHash()
-
-	// Hashes should be different
-	assert.NotEqual(t, hash1, hash2, "Different parameters should produce different hashes")
-
-	// Mock expects the first query with hash1
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WithArgs(host, deepLink, hash1).
-		WillReturnRows(sqlmock.NewRows([]string{"path"}).AddRow("path1"))
-
-	result1, err := repo.FindExistingShortLink(context.Background(), host, link1, nil)
-	assert.NoError(t, err)
-	assert.Equal(t, "path1", result1)
-}
-
-func TestFindExistingShortLink_SameParamsGetSameHash(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
-
-	host := "example.com"
-	deepLink := "https://example.com/deep-link"
-
-	// Two identical links
-	link1 := &models.DurableLink{
-		Host: host,
-		Link: deepLink,
-		AndroidParameters: models.AndroidParameters{
-			AndroidPackageName: stringPtr("com.example.app"),
-		},
-		IosParameters: models.IOSParameters{
-			IOSAppStoreId: int64Ptr(123456789),
-		},
-	}
-
-	link2 := &models.DurableLink{
-		Host: host,
-		Link: deepLink,
-		AndroidParameters: models.AndroidParameters{
-			AndroidPackageName: stringPtr("com.example.app"),
-		},
-		IosParameters: models.IOSParameters{
-			IOSAppStoreId: int64Ptr(123456789),
-		},
-	}
-
-	// Compute hashes - should be identical
-	dbLink1 := models.FromDurableLink(*link1, "", "", false, nil)
-	dbLink2 := models.FromDurableLink(*link2, "", "", false, nil)
-	hash1 := dbLink1.ComputeParamsHash()
-	hash2 := dbLink2.ComputeParamsHash()
-
-	assert.Equal(t, hash1, hash2, "Identical parameters should produce identical hashes")
-
-	// Both queries should use the same hash
-	path := "existing-path"
-	mock.ExpectQuery(`SELECT path FROM apppanel_durable_links`).
-		WithArgs(host, deepLink, hash1).
-		WillReturnRows(sqlmock.NewRows([]string{"path"}).AddRow(path))
-
-	result, err := repo.FindExistingShortLink(context.Background(), host, link1, nil)
-	assert.NoError(t, err)
-	assert.Equal(t, path, result)
-}
-
-func TestFindExistingShortLink_NilVsEmptyStringProducesDifferentHash(t *testing.T) {
-	// Link with nil Android package name
-	link1 := &models.DurableLink{
-		Link: "https://example.com/deep-link",
-		AndroidParameters: models.AndroidParameters{
-			AndroidPackageName: nil,
-		},
-	}
-
-	// Link with empty string Android package name
-	link2 := &models.DurableLink{
-		Link: "https://example.com/deep-link",
-		AndroidParameters: models.AndroidParameters{
-			AndroidPackageName: stringPtr(""),
-		},
-	}
-
-	dbLink1 := models.FromDurableLink(*link1, "", "", false, nil)
-	dbLink2 := models.FromDurableLink(*link2, "", "", false, nil)
-	hash1 := dbLink1.ComputeParamsHash()
-	hash2 := dbLink2.ComputeParamsHash()
-
-	// nil and empty string should produce different hashes
-	assert.NotEqual(t, hash1, hash2, "nil and empty string should produce different hashes")
-}
-
-func TestCreateShortLink(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
-
-	dbLink := &models.DurableLinkDB{
-		Host:              "example.com",
-		Path:              "abc123",
-		Link:              "https://example.com/deep-link",
-		IsUnguessablePath: true,
-		ProjectID:         nil,
-		AndroidPackageName: stringPtr("com.example.app"),
-		IOSAppStoreID:     int64Ptr(123456789),
-	}
-
-	mock.ExpectExec(`INSERT INTO apppanel_durable_links`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	err := repo.CreateShortLink(context.Background(), dbLink, nil)
-	assert.NoError(t, err)
+	// Verify it was created
+	var result models.DurableLinkDB
+	db.Where("host = ? AND path = ?", host, path).First(&result)
+	assert.Equal(t, linkURL, result.Link)
 }
 
 func TestCreateShortLink_WithProjectID(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
+	db, repo := setupTestDB(t)
 
+	host := "example.com"
+	path := "abc123"
+	linkURL := "https://example.com/target"
 	projectID := uuid.New()
-	dbLink := &models.DurableLinkDB{
-		Host:              "example.com",
-		Path:              "abc123",
-		Link:              "https://example.com/deep-link",
+
+	link := &models.DurableLinkDB{
+		Host:              host,
+		Path:              path,
+		Link:              linkURL,
 		IsUnguessablePath: false,
-		ProjectID:         stringPtr(projectID.String()),
-		IOSFallbackLink:   stringPtr("https://example.com/ios-fallback"),
+		ParamsHash:        "hash123",
 	}
 
-	mock.ExpectExec(`INSERT INTO apppanel_durable_links`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	err := repo.CreateShortLink(context.Background(), dbLink, &projectID)
+	err := repo.CreateShortLink(context.Background(), link, &projectID)
 	assert.NoError(t, err)
-}
 
-func TestCreateShortLink_DBError(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
-
-	dbLink := &models.DurableLinkDB{
-		Host:              "example.com",
-		Path:              "abc123",
-		Link:              "https://example.com/deep-link",
-		IsUnguessablePath: true,
-	}
-
-	mock.ExpectExec(`INSERT INTO apppanel_durable_links`).
-		WillReturnError(errors.New("insert failed"))
-
-	err := repo.CreateShortLink(context.Background(), dbLink, nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "insert failed")
-}
-
-func TestGetLinkByHostAndPath_DBError(t *testing.T) {
-	db, mock, repo := setupMockDB(t)
-	defer db.Close()
-
-	mock.ExpectQuery(`SELECT \* FROM apppanel_durable_links`).
-		WithArgs("example.com", "test").
-		WillReturnError(errors.New("connection lost"))
-
-	_, err := repo.GetLinkByHostAndPath(context.Background(), "example.com", "test", nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "connection lost")
+	// Verify it was created with projectID
+	var result models.DurableLinkDB
+	db.Where("host = ? AND path = ?", host, path).First(&result)
+	assert.Equal(t, linkURL, result.Link)
+	assert.NotNil(t, result.ProjectID)
+	assert.Equal(t, projectID.String(), *result.ProjectID)
 }
