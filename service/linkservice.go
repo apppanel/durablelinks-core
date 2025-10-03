@@ -4,10 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/apppanel/durablelinks-core/models"
@@ -23,13 +21,14 @@ type TenantConfig struct {
 	DomainAllowList       []string
 	ShortPathLength       int
 	UnguessablePathLength int
+	DefaultIOSAppStoreId  *int64
+	DefaultAndroidPackage *string
 }
 
 type LinkService interface {
 	CreateDurableLink(ctx context.Context, params models.CreateDurableLinkRequest, projectID *uuid.UUID, tenantCfg TenantConfig) (*models.ShortLinkResponse, error)
 	ParseLongDurableLink(longLink string) (models.CreateDurableLinkRequest, error)
 	ResolveShortPath(ctx context.Context, rawURL string, projectID *uuid.UUID, tenantCfg TenantConfig) (*models.LongLinkResponse, error)
-	PrepareDurableLinkRequest(input map[string]any) (models.CreateDurableLinkRequest, error)
 }
 
 type linkService struct {
@@ -47,31 +46,23 @@ func (s *linkService) getLongLinkFromHostAndPath(
 	host string,
 	path string,
 	projectID *uuid.UUID,
-	tenantCfg TenantConfig,
 ) (*models.LongLinkResponse, error) {
-	rawQueryStr, err := s.repo.GetQueryParamsByHostAndPath(ctx, host, path, projectID)
+	link, err := s.repo.GetLinkByHostAndPath(ctx, host, path, projectID)
 	if err != nil {
 		return nil, err
 	}
 
-	longLink := fmt.Sprintf("%s://%s/%s", tenantCfg.URLScheme, host, path)
-	if rawQueryStr != "" {
-		longLink += "?" + rawQueryStr
-	}
-
 	log.Debug().
 		Str("path", path).
-		Str("long_link", longLink).
+		Str("long_link", link.Link).
 		Msg("Link retrieved from service")
 
 	return &models.LongLinkResponse{
-		LongLink: longLink,
+		LongLink: link.Link,
 	}, nil
 }
 
 func (s *linkService) CreateDurableLink(ctx context.Context, params models.CreateDurableLinkRequest, projectID *uuid.UUID, tenantCfg TenantConfig) (*models.ShortLinkResponse, error) {
-	warnings := []models.Warning{}
-
 	log.Debug().
 		Str("params", fmt.Sprintf("%+v", params)).
 		Msg("Dynamic link parameters")
@@ -91,87 +82,33 @@ func (s *linkService) CreateDurableLink(ctx context.Context, params models.Creat
 		return nil, ErrDomainLinkNotAllowed
 	}
 
-	isi := params.DurableLinkInfo.IosParameters.IOSAppStoreId
+	warnings := []models.Warning{}
 
-	if isi != "" {
-		if _, err := strconv.ParseUint(isi, 10, 64); err != nil {
-			return nil, ErrInvalidAppStoreID
-		}
+	// Apply defaults from tenant config if not provided
+	if params.DurableLinkInfo.IosParameters.IOSAppStoreId == nil && tenantCfg.DefaultIOSAppStoreId != nil {
+		params.DurableLinkInfo.IosParameters.IOSAppStoreId = tenantCfg.DefaultIOSAppStoreId
+		warnings = append(warnings, models.Warning{
+			WarningCode:    "DEFAULT_APPLIED",
+			WarningMessage: fmt.Sprintf("Using default iOS App Store ID: %d", *tenantCfg.DefaultIOSAppStoreId),
+		})
 	}
 
-	queryParams := url.Values{}
-	queryParams.Add("link", params.DurableLinkInfo.Link)
-
-	addParam := func(key, value string) {
-		if value != "" {
-			queryParams.Add(key, value)
-		}
+	if params.DurableLinkInfo.AndroidParameters.AndroidPackageName == nil && tenantCfg.DefaultAndroidPackage != nil {
+		params.DurableLinkInfo.AndroidParameters.AndroidPackageName = tenantCfg.DefaultAndroidPackage
+		warnings = append(warnings, models.Warning{
+			WarningCode:    "DEFAULT_APPLIED",
+			WarningMessage: fmt.Sprintf("Using default Android package name: %s", *tenantCfg.DefaultAndroidPackage),
+		})
 	}
 
-	addParam("apn", params.DurableLinkInfo.AndroidParameters.AndroidPackageName)
-	addParam("afl", params.DurableLinkInfo.AndroidParameters.AndroidFallbackLink)
-	addParam("amv", params.DurableLinkInfo.AndroidParameters.AndroidMinPackageVersionCode)
+	validationWarnings := s.validateLinkParameters(&params.DurableLinkInfo)
+	warnings = append(warnings, validationWarnings...)
 
-	addParam("ifl", params.DurableLinkInfo.IosParameters.IOSFallbackLink)
-	addParam("ipfl", params.DurableLinkInfo.IosParameters.IOSIpadFallbackLink)
-	addParam("isi", isi)
-
-	addParam("ofl", params.DurableLinkInfo.OtherPlatformParameters.FallbackURL)
-
-	addParam("st", params.DurableLinkInfo.SocialMetaTagInfo.SocialTitle)
-	addParam("sd", params.DurableLinkInfo.SocialMetaTagInfo.SocialDescription)
-
-	si := params.DurableLinkInfo.SocialMetaTagInfo.SocialImageLink
-
-	addParam("si", si)
-
-	if si != "" {
-		if !utils.IsURL(si) {
-			warnings = append(warnings, models.Warning{
-				WarningCode:    "MALFORMED_PARAM",
-				WarningMessage: "Param 'si' is not a valid URL",
-			})
-		}
+	shortPath, suffixWarning := s.validateSuffixOption(params.Suffix)
+	if suffixWarning != nil {
+		warnings = append(warnings, *suffixWarning)
 	}
-
-	addParam("utm_source", params.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmSource)
-	addParam("utm_medium", params.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmMedium)
-	addParam("utm_campaign", params.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmCampaign)
-	addParam("utm_term", params.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmTerm)
-	addParam("utm_content", params.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmContent)
-
-	itunesAnalytics := params.DurableLinkInfo.AnalyticsInfo.ItunesConnectAnalytics
-	pt := itunesAnalytics.Pt
-	addParam("pt", pt)
-
-	addUnrecognizedWarning := func(paramName, paramValue, missingParam string) {
-		if paramValue != "" {
-			warnings = append(warnings, models.Warning{
-				WarningCode:    "UNRECOGNIZED_PARAM",
-				WarningMessage: fmt.Sprintf("Param '%s' is not needed, since '%s' is not specified.", paramName, missingParam),
-			})
-		}
-	}
-
-	if isi == "" {
-		addUnrecognizedWarning("at", itunesAnalytics.At, "isi")
-		addUnrecognizedWarning("ct", itunesAnalytics.Ct, "isi")
-		addUnrecognizedWarning("mt", itunesAnalytics.Mt, "isi")
-		addUnrecognizedWarning("pt", pt, "isi")
-	}
-
-	if pt == "" {
-		addUnrecognizedWarning("at", itunesAnalytics.At, "pt")
-		addUnrecognizedWarning("ct", itunesAnalytics.Ct, "pt")
-		addUnrecognizedWarning("mt", itunesAnalytics.Mt, "pt")
-	}
-
-	addParam("at", itunesAnalytics.At)
-	addParam("ct", itunesAnalytics.Ct)
-	addParam("mt", itunesAnalytics.Mt)
-
-	shortPath := params.Suffix.Option == "SHORT"
-	response, err := s.createOrGetShortLink(ctx, host, queryParams, shortPath, projectID, tenantCfg)
+	response, err := s.createOrGetShortLink(ctx, host, params.DurableLinkInfo, shortPath, projectID, tenantCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -180,88 +117,85 @@ func (s *linkService) CreateDurableLink(ctx context.Context, params models.Creat
 	return response, nil
 }
 
-func (s *linkService) parseLongDurableLink(longDurableLink string) (models.CreateDurableLinkRequest, error) {
-	var req models.CreateDurableLinkRequest
-
-	log.Debug().
-		Str("long_link", longDurableLink).
-		Msg("Parsing long dynamic link")
-
-	u, err := url.Parse(longDurableLink)
-	if err != nil {
-		return req, ErrInvalidURLFormat
-	}
-
-	if u.Host == "" {
-		return req, ErrHostInvalid
-	}
-
-	req.DurableLinkInfo.Host = u.Host
-
-	params := u.Query()
-
-	req.DurableLinkInfo.Link = params.Get("link")
-
-	log.Debug().
-		Str("link", req.DurableLinkInfo.Link).
-		Msg("Parsed link")
-
-	setParam := func(paramKey string, dest *string) {
-		if value := params.Get(paramKey); value != "" {
-			*dest = value
+func (s *linkService) validateSuffixOption(suffix models.Suffix) (bool, *models.Warning) {
+	option := strings.ToUpper(suffix.Option)
+	if option != "SHORT" && option != "UNGUESSABLE" {
+		return false, &models.Warning{
+			WarningCode:    "INVALID_SUFFIX_OPTION",
+			WarningMessage: fmt.Sprintf("Param 'suffix.option' must be 'SHORT' or 'UNGUESSABLE'. Received '%s', defaulting to 'UNGUESSABLE'.", suffix.Option),
 		}
 	}
 
-	setParam("apn", &req.DurableLinkInfo.AndroidParameters.AndroidPackageName)
-	setParam("afl", &req.DurableLinkInfo.AndroidParameters.AndroidFallbackLink)
-	setParam("amv", &req.DurableLinkInfo.AndroidParameters.AndroidMinPackageVersionCode)
+	if option == "UNGUESSABLE" {
+		return false, nil
+	}
+	return true, nil
+}
 
-	setParam("isi", &req.DurableLinkInfo.IosParameters.IOSAppStoreId)
-	setParam("ifl", &req.DurableLinkInfo.IosParameters.IOSFallbackLink)
-	setParam("ipfl", &req.DurableLinkInfo.IosParameters.IOSIpadFallbackLink)
+func (s *linkService) validateLinkParameters(dl *models.DurableLink) []models.Warning {
+	warnings := []models.Warning{}
 
-	setParam("ofl", &req.DurableLinkInfo.OtherPlatformParameters.FallbackURL)
+	addUnrecognizedWarning := func(paramName string, paramValue *string, missingParam string) {
+		if paramValue != nil && *paramValue != "" {
+			warnings = append(warnings, models.Warning{
+				WarningCode:    "UNRECOGNIZED_PARAM",
+				WarningMessage: fmt.Sprintf("Param '%s' is not needed, since '%s' is not specified.", paramName, missingParam),
+			})
+		}
+	}
 
-	setParam("utm_source", &req.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmSource)
-	setParam("utm_medium", &req.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmMedium)
-	setParam("utm_campaign", &req.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmCampaign)
-	setParam("utm_term", &req.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmTerm)
+	validateAndClearInvalidURL := func(url **string, jsonFieldName string) {
+		if *url != nil && **url != "" && !utils.IsURL(**url) {
+			warnings = append(warnings, models.Warning{
+				WarningCode:    "MALFORMED_PARAM",
+				WarningMessage: fmt.Sprintf("Param '%s' is not a valid URL", jsonFieldName),
+			})
+			// Clear invalid URL - don't save garbage data
+			*url = nil
+		}
+	}
 
-	setParam("utm_content", &req.DurableLinkInfo.AnalyticsInfo.MarketingParameters.UtmContent)
-	setParam("at", &req.DurableLinkInfo.AnalyticsInfo.ItunesConnectAnalytics.At)
-	setParam("ct", &req.DurableLinkInfo.AnalyticsInfo.ItunesConnectAnalytics.Ct)
-	setParam("mt", &req.DurableLinkInfo.AnalyticsInfo.ItunesConnectAnalytics.Mt)
-	setParam("pt", &req.DurableLinkInfo.AnalyticsInfo.ItunesConnectAnalytics.Pt)
+	validateAndClearInvalidURL(&dl.AndroidParameters.AndroidFallbackLink, "androidFallbackLink")
+	validateAndClearInvalidURL(&dl.IosParameters.IOSFallbackLink, "iosFallbackLink")
+	validateAndClearInvalidURL(&dl.IosParameters.IOSIpadFallbackLink, "iosIpadFallbackLink")
+	validateAndClearInvalidURL(&dl.OtherPlatformParameters.FallbackURL, "fallbackUrl")
+	validateAndClearInvalidURL(&dl.SocialMetaTagInfo.SocialImageLink, "socialImageLink")
 
-	setParam("st", &req.DurableLinkInfo.SocialMetaTagInfo.SocialTitle)
-	setParam("sd", &req.DurableLinkInfo.SocialMetaTagInfo.SocialDescription)
-	setParam("si", &req.DurableLinkInfo.SocialMetaTagInfo.SocialImageLink)
+	isi := dl.IosParameters.IOSAppStoreId
+	itunes := dl.AnalyticsInfo.ItunesConnectAnalytics
+	pt := itunes.Pt
 
-	setParam("path", &req.Suffix.Option)
+	if isi == nil {
+		addUnrecognizedWarning("at", itunes.At, "isi")
+		addUnrecognizedWarning("ct", itunes.Ct, "isi")
+		addUnrecognizedWarning("mt", itunes.Mt, "isi")
+		addUnrecognizedWarning("pt", pt, "isi")
+	}
 
-	log.Debug().
-		Str("req", fmt.Sprintf("%+v", req)).
-		Msg("Parsed long dynamic link")
+	if pt == nil || *pt == "" {
+		addUnrecognizedWarning("at", itunes.At, "pt")
+		addUnrecognizedWarning("ct", itunes.Ct, "pt")
+		addUnrecognizedWarning("mt", itunes.Mt, "pt")
+	}
 
-	return req, nil
+	return warnings
 }
 
 func (s *linkService) createOrGetShortLink(
 	ctx context.Context,
 	host string,
-	queryParams url.Values,
+	link models.DurableLink,
 	shortPath bool,
 	projectID *uuid.UUID,
 	tenantCfg TenantConfig,
 ) (*models.ShortLinkResponse, error) {
-	rawQS := queryParams.Encode()
 	if shortPath {
-		if path, err := s.findExistingShortLink(ctx, host, rawQS, projectID); err == nil {
+		if path, err := s.repo.FindExistingShortLink(ctx, host, &link, projectID); err == nil {
 			full := fmt.Sprintf("%s://%s/%s", tenantCfg.URLScheme, host, path)
 			log.Debug().
 				Str("path", path).
-				Str("query_params", rawQS).
-				Msg("Re‑using existing short link")
+				Str("link", link.Link).
+				Msg("Re-using existing short link")
 			return &models.ShortLinkResponse{ShortLink: full, Warnings: []models.Warning{}}, nil
 
 		} else if err != sql.ErrNoRows {
@@ -278,34 +212,24 @@ func (s *linkService) createOrGetShortLink(
 	}
 	path := generateDurableLinkPath(length)
 
-	if err := s.createShortLink(ctx, host, path, rawQS, !shortPath, projectID); err != nil {
+	var projectIDStr *string
+	if projectID != nil {
+		idStr := projectID.String()
+		projectIDStr = &idStr
+	}
+
+	dbLink := models.FromDurableLink(link, host, path, !shortPath, projectIDStr)
+	if err := s.repo.CreateShortLink(ctx, dbLink, projectID); err != nil {
 		return nil, fmt.Errorf("failed to store link: %w", err)
 	}
 
 	full := fmt.Sprintf("%s://%s/%s", tenantCfg.URLScheme, host, path)
 	log.Debug().
 		Str("path", path).
-		Str("query_params", rawQS).
+		Str("link", link.Link).
 		Msg("New link stored in database")
 
 	return &models.ShortLinkResponse{ShortLink: full, Warnings: []models.Warning{}}, nil
-}
-
-func (s *linkService) findExistingShortLink(
-	ctx context.Context,
-	host, rawQS string,
-	projectID *uuid.UUID,
-) (string, error) {
-	return s.repo.FindExistingShortLink(ctx, host, rawQS, projectID)
-}
-
-func (s *linkService) createShortLink(
-	ctx context.Context,
-	host, path, rawQS string,
-	unguessable bool,
-	projectID *uuid.UUID,
-) error {
-	return s.repo.CreateShortLink(ctx, host, path, rawQS, unguessable, projectID)
 }
 
 func (s *linkService) ResolveShortPath(ctx context.Context, rawURL string, projectID *uuid.UUID, tenantCfg TenantConfig) (*models.LongLinkResponse, error) {
@@ -317,11 +241,11 @@ func (s *linkService) ResolveShortPath(ctx context.Context, rawURL string, proje
 	normalizedHost := removePreviewFromHost(u.Host)
 
 	pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(pathParts) != 1 {
-		return nil, fmt.Errorf("unexpected path format: %w", ErrInvalidPathFormat)
+	if len(pathParts) != 1 || pathParts[0] == "" {
+		return nil, ErrInvalidPathFormat
 	}
 
-	return s.getLongLinkFromHostAndPath(ctx, normalizedHost, pathParts[0], projectID, tenantCfg)
+	return s.getLongLinkFromHostAndPath(ctx, normalizedHost, pathParts[0], projectID)
 }
 
 func generateDurableLinkPath(length int) string {
@@ -346,8 +270,8 @@ func generateDurableLinkPath(length int) string {
 }
 
 func removePreviewFromHost(host string) string {
-	if strings.HasPrefix(host, "preview.") {
-		return strings.TrimPrefix(host, "preview.")
+	if after, ok := strings.CutPrefix(host, "preview."); ok {
+		return after
 	}
 	parts := strings.SplitN(host, ".", 2) // ["acme-preview", "short.link"]
 	if len(parts) == 2 && strings.HasSuffix(parts[0], "-preview") {
@@ -356,36 +280,4 @@ func removePreviewFromHost(host string) string {
 	}
 
 	return host
-}
-
-func (s *linkService) PrepareDurableLinkRequest(input map[string]any) (models.CreateDurableLinkRequest, error) {
-	var req models.CreateDurableLinkRequest
-
-	if longLink, ok := input["longDurableLink"].(string); ok && longLink != "" {
-		parsedReq, err := s.parseLongDurableLink(longLink)
-		if err != nil {
-			return models.CreateDurableLinkRequest{}, err
-		}
-		req = parsedReq
-	} else {
-		reqBytes, err := json.Marshal(input)
-		if err != nil {
-			return models.CreateDurableLinkRequest{}, ErrInvalidFormat
-		}
-		if err := json.Unmarshal(reqBytes, &req); err != nil {
-			return models.CreateDurableLinkRequest{}, ErrInvalidFormat
-		}
-	}
-
-	if req.DurableLinkInfo.Host == "" {
-		return models.CreateDurableLinkRequest{}, ErrMissingHost
-	}
-	if req.DurableLinkInfo.Link == "" {
-		return models.CreateDurableLinkRequest{}, ErrMissingLink
-	}
-	if err := utils.ValidateURLScheme(req.DurableLinkInfo.Link); err != nil {
-		return models.CreateDurableLinkRequest{}, err
-	}
-
-	return req, nil
 }

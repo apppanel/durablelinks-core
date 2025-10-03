@@ -6,14 +6,15 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/apppanel/durablelinks-core/models"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
 type LinkRepository interface {
-	GetQueryParamsByHostAndPath(ctx context.Context, host, path string, projectID *uuid.UUID) (string, error)
-	FindExistingShortLink(ctx context.Context, host, rawQS string, projectID *uuid.UUID) (string, error)
-	CreateShortLink(ctx context.Context, host, path, rawQS string, unguessable bool, projectID *uuid.UUID) error
+	GetLinkByHostAndPath(ctx context.Context, host, path string, projectID *uuid.UUID) (*models.DurableLink, error)
+	FindExistingShortLink(ctx context.Context, host string, link *models.DurableLink, projectID *uuid.UUID) (string, error)
+	CreateShortLink(ctx context.Context, link *models.DurableLinkDB, projectID *uuid.UUID) error
 }
 
 type linkRepository struct {
@@ -26,63 +27,145 @@ func NewLinkRepository(db *sql.DB) LinkRepository {
 	}
 }
 
-func (r *linkRepository) GetQueryParamsByHostAndPath(ctx context.Context, host, path string, projectID *uuid.UUID) (string, error) {
-	var rawQueryStr string
+func (r *linkRepository) GetLinkByHostAndPath(ctx context.Context, host, path string, projectID *uuid.UUID) (*models.DurableLink, error) {
+	var dbLink models.DurableLinkDB
 
-	query := `SELECT query_params FROM apppanel_durable_links WHERE host = $1 AND path = $2`
+	query := `SELECT * FROM apppanel_durable_links WHERE host = $1 AND path = $2`
 	args := []interface{}{host, path}
 
 	if projectID != nil {
 		query += ` AND project_id = $3`
-		args = append(args, *projectID)
+		args = append(args, projectID.String())
 	}
 
 	row := r.db.QueryRowContext(ctx, query, args...)
-	if err := row.Scan(&rawQueryStr); err != nil {
+	err := row.Scan(
+		&dbLink.ID,
+		&dbLink.Host,
+		&dbLink.Path,
+		&dbLink.Link,
+		&dbLink.IsUnguessablePath,
+		&dbLink.ProjectID,
+		&dbLink.AndroidPackageName,
+		&dbLink.AndroidFallbackLink,
+		&dbLink.AndroidMinVersion,
+		&dbLink.IOSFallbackLink,
+		&dbLink.IOSIpadFallbackLink,
+		&dbLink.IOSAppStoreID,
+		&dbLink.SocialTitle,
+		&dbLink.SocialDescription,
+		&dbLink.SocialImageLink,
+		&dbLink.UtmSource,
+		&dbLink.UtmMedium,
+		&dbLink.UtmCampaign,
+		&dbLink.UtmTerm,
+		&dbLink.UtmContent,
+		&dbLink.ItunesPt,
+		&dbLink.ItunesAt,
+		&dbLink.ItunesCt,
+		&dbLink.ItunesMt,
+		&dbLink.OtherFallbackURL,
+		&dbLink.ParamsHash,
+		&dbLink.CreatedAt,
+		&dbLink.UpdatedAt,
+	)
+
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			log.Debug().
+				Str("host", host).
 				Str("path", path).
 				Msg("Link not found in database")
-			return "", ErrLinkNotFound
+			return nil, ErrLinkNotFound
 		}
 		log.Error().
 			Err(err).
+			Str("host", host).
 			Str("path", path).
 			Msg("Failed to retrieve link from database")
-		return "", fmt.Errorf("database error: %w", err)
+		return nil, fmt.Errorf("database error: %w", err)
 	}
 
-	return rawQueryStr, nil
+	dl := dbLink.ToDurableLink()
+	return &dl, nil
 }
 
-func (r *linkRepository) FindExistingShortLink(ctx context.Context, host, rawQS string, projectID *uuid.UUID) (string, error) {
+func (r *linkRepository) FindExistingShortLink(ctx context.Context, host string, link *models.DurableLink, projectID *uuid.UUID) (string, error) {
 	var path string
-
-	query := `SELECT path FROM apppanel_durable_links WHERE host = $1 AND query_params = $2 AND is_unguessable_path = FALSE`
-	args := []interface{}{host, rawQS}
+	dbLink := models.FromDurableLink(*link, "", "", false, nil)
+	paramsHash := dbLink.ComputeParamsHash()
+	query := `
+		SELECT path FROM apppanel_durable_links
+		WHERE host = $1
+		AND link = $2
+		AND params_hash = $3
+		AND is_unguessable_path = FALSE
+	`
+	args := []interface{}{host, link.Link, paramsHash}
 
 	if projectID != nil {
-		query += ` AND project_id = $3`
-		args = append(args, *projectID)
+		query += ` AND project_id = $4`
+		args = append(args, projectID.String())
+	} else {
+		query += ` AND project_id IS NULL`
 	}
-
 	query += ` LIMIT 1`
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(&path)
 	return path, err
 }
 
-func (r *linkRepository) CreateShortLink(ctx context.Context, host, path, rawQS string, unguessable bool, projectID *uuid.UUID) error {
-	var query string
-	var args []interface{}
+func (r *linkRepository) CreateShortLink(ctx context.Context, link *models.DurableLinkDB, projectID *uuid.UUID) error {
+	query := `
+		INSERT INTO apppanel_durable_links (
+			host, path, link, is_unguessable_path, project_id,
+			android_package_name, android_fallback_link, android_min_version,
+			ios_fallback_link, ios_ipad_fallback_link, ios_app_store_id,
+			social_title, social_description, social_image_link,
+			utm_source, utm_medium, utm_campaign, utm_term, utm_content,
+			itunes_pt, itunes_at, itunes_ct, itunes_mt,
+			other_fallback_url, params_hash
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7, $8,
+			$9, $10, $11,
+			$12, $13, $14,
+			$15, $16, $17, $18, $19,
+			$20, $21, $22, $23,
+			$24, $25
+		)`
 
+	var projectIDStr *string
 	if projectID != nil {
-		query = `INSERT INTO apppanel_durable_links (host, path, query_params, is_unguessable_path, project_id) VALUES ($1, $2, $3, $4, $5)`
-		args = []interface{}{host, path, rawQS, unguessable, *projectID}
-	} else {
-		query = `INSERT INTO apppanel_durable_links (host, path, query_params, is_unguessable_path) VALUES ($1, $2, $3, $4)`
-		args = []interface{}{host, path, rawQS, unguessable}
+		s := projectID.String()
+		projectIDStr = &s
 	}
 
-	_, err := r.db.ExecContext(ctx, query, args...)
+	_, err := r.db.ExecContext(ctx, query,
+		link.Host,
+		link.Path,
+		link.Link,
+		link.IsUnguessablePath,
+		projectIDStr,
+		link.AndroidPackageName,
+		link.AndroidFallbackLink,
+		link.AndroidMinVersion,
+		link.IOSFallbackLink,
+		link.IOSIpadFallbackLink,
+		link.IOSAppStoreID,
+		link.SocialTitle,
+		link.SocialDescription,
+		link.SocialImageLink,
+		link.UtmSource,
+		link.UtmMedium,
+		link.UtmCampaign,
+		link.UtmTerm,
+		link.UtmContent,
+		link.ItunesPt,
+		link.ItunesAt,
+		link.ItunesCt,
+		link.ItunesMt,
+		link.OtherFallbackURL,
+		link.ParamsHash,
+	)
 	return err
 }

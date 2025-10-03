@@ -1,8 +1,8 @@
 package models
 
 type DurableLink struct {
-	Host                    string                  `json:"host"`
-	Link                    string                  `json:"link"`
+	Host                    string                  `json:"host" validate:"required"`
+	Link                    string                  `json:"link" validate:"required,url"`
 	AndroidParameters       AndroidParameters       `json:"androidParameters,omitempty"`
 	IosParameters           IOSParameters           `json:"iosParameters,omitempty"`
 	OtherPlatformParameters OtherPlatformParameters `json:"otherPlatformParameters,omitempty"`
@@ -11,19 +11,19 @@ type DurableLink struct {
 }
 
 type AndroidParameters struct {
-	AndroidPackageName           string `json:"androidPackageName,omitempty"`
-	AndroidFallbackLink          string `json:"androidFallbackLink,omitempty"`
-	AndroidMinPackageVersionCode string `json:"androidMinPackageVersionCode,omitempty"`
+	AndroidPackageName           *string `json:"androidPackageName,omitempty"`
+	AndroidFallbackLink          *string `json:"androidFallbackLink,omitempty"`
+	AndroidMinPackageVersionCode *string `json:"androidMinPackageVersionCode,omitempty"`
 }
 
 type IOSParameters struct {
-	IOSFallbackLink     string `json:"iosFallbackLink,omitempty"`
-	IOSIpadFallbackLink string `json:"iosIpadFallbackLink,omitempty"`
-	IOSAppStoreId       string `json:"iosAppStoreId,omitempty"`
+	IOSFallbackLink     *string `json:"iosFallbackLink,omitempty"`
+	IOSIpadFallbackLink *string `json:"iosIpadFallbackLink,omitempty"`
+	IOSAppStoreId       *int64  `json:"iosAppStoreId,omitempty"`
 }
 
 type OtherPlatformParameters struct {
-	FallbackURL string `json:"ofl,omitempty"`
+	FallbackURL *string `json:"fallbackUrl,omitempty"`
 }
 
 type AnalyticsInfo struct {
@@ -32,26 +32,26 @@ type AnalyticsInfo struct {
 }
 
 type MarketingParameters struct {
-	UtmSource   string `json:"utmSource,omitempty"`
-	UtmMedium   string `json:"utmMedium,omitempty"`
-	UtmCampaign string `json:"utmCampaign,omitempty"`
-	UtmTerm     string `json:"utmTerm,omitempty"`
-	UtmContent  string `json:"utmContent,omitempty"`
+	UtmSource   *string `json:"utmSource,omitempty"`
+	UtmMedium   *string `json:"utmMedium,omitempty"`
+	UtmCampaign *string `json:"utmCampaign,omitempty"`
+	UtmTerm     *string `json:"utmTerm,omitempty"`
+	UtmContent  *string `json:"utmContent,omitempty"`
 }
 
 type ITunesConnectAnalytics struct {
-	At string `json:"at,omitempty"`
-	Ct string `json:"ct,omitempty"`
-	Mt string `json:"mt,omitempty"`
-	Pt string `json:"pt,omitempty"`
+	At *string `json:"at,omitempty"`
+	Ct *string `json:"ct,omitempty"`
+	Mt *string `json:"mt,omitempty"`
+	Pt *string `json:"pt,omitempty"`
 }
 
 type SocialMetaTagInfo struct {
-	SocialTitle       string `json:"socialTitle,omitempty"`
-	SocialDescription string `json:"socialDescription,omitempty"`
-	SocialImageLink   string `json:"socialImageLink,omitempty"`
+	SocialTitle       *string `json:"socialTitle,omitempty"`
+	SocialDescription *string `json:"socialDescription,omitempty"`
+	SocialImageLink   *string `json:"socialImageLink,omitempty"`
 }
 
 type Suffix struct {
-	Option string `json:"option,omitempty"` // "SHORT" or "UNGUESSABLE"
+	Option string `json:"option,omitempty"` // Must be "SHORT" or "UNGUESSABLE" (case-insensitive). Defaults to "UNGUESSABLE" with warning if invalid.
 }
