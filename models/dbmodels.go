@@ -2,39 +2,39 @@ package models
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"fmt"
-	"time"
 )
 
 type DurableLinkDB struct {
-	ID                  int64     `db:"id"`
-	Host                string    `db:"host"`
-	Path                string    `db:"path"`
-	Link                string    `db:"link"`
-	IsUnguessablePath   bool      `db:"is_unguessable_path"`
-	ProjectID           *string   `db:"project_id"`
-	AndroidPackageName  *string   `db:"android_package_name"`
-	AndroidFallbackLink *string   `db:"android_fallback_link"`
-	AndroidMinVersion   *string   `db:"android_min_version"`
-	IOSFallbackLink     *string   `db:"ios_fallback_link"`
-	IOSIpadFallbackLink *string   `db:"ios_ipad_fallback_link"`
-	IOSAppStoreID       *int64    `db:"ios_app_store_id"`
-	SocialTitle         *string   `db:"social_title"`
-	SocialDescription   *string   `db:"social_description"`
-	SocialImageLink     *string   `db:"social_image_link"`
-	UtmSource           *string   `db:"utm_source"`
-	UtmMedium           *string   `db:"utm_medium"`
-	UtmCampaign         *string   `db:"utm_campaign"`
-	UtmTerm             *string   `db:"utm_term"`
-	UtmContent          *string   `db:"utm_content"`
-	ItunesPt            *string   `db:"itunes_pt"`
-	ItunesAt            *string   `db:"itunes_at"`
-	ItunesCt            *string   `db:"itunes_ct"`
-	ItunesMt            *string   `db:"itunes_mt"`
-	OtherFallbackURL    *string   `db:"other_fallback_url"`
-	ParamsHash          string    `db:"params_hash"`
-	CreatedAt           time.Time `db:"created_at"`
-	UpdatedAt           time.Time `db:"updated_at"`
+	ID                  int64        `db:"id"`
+	Host                string       `db:"host"`
+	Path                string       `db:"path"`
+	Link                string       `db:"link"`
+	IsUnguessablePath   bool         `db:"is_unguessable_path"`
+	ProjectID           *string      `db:"project_id"`
+	AndroidPackageName  *string      `db:"android_package_name"`
+	AndroidFallbackLink *string      `db:"android_fallback_link"`
+	AndroidMinVersion   *string      `db:"android_min_version"`
+	IOSFallbackLink     *string      `db:"ios_fallback_link"`
+	IOSIpadFallbackLink *string      `db:"ios_ipad_fallback_link"`
+	IOSAppStoreID       *int64       `db:"ios_app_store_id"`
+	SocialTitle         *string      `db:"social_title"`
+	SocialDescription   *string      `db:"social_description"`
+	SocialImageLink     *string      `db:"social_image_link"`
+	UtmSource           *string      `db:"utm_source"`
+	UtmMedium           *string      `db:"utm_medium"`
+	UtmCampaign         *string      `db:"utm_campaign"`
+	UtmTerm             *string      `db:"utm_term"`
+	UtmContent          *string      `db:"utm_content"`
+	ItunesPt            *string      `db:"itunes_pt"`
+	ItunesAt            *string      `db:"itunes_at"`
+	ItunesCt            *string      `db:"itunes_ct"`
+	ItunesMt            *string      `db:"itunes_mt"`
+	OtherFallbackURL    *string      `db:"other_fallback_url"`
+	ParamsHash          string       `db:"params_hash"`
+	CreatedAt           sql.NullTime `db:"created_at"`
+	UpdatedAt           sql.NullTime `db:"updated_at"`
 }
 
 func (db *DurableLinkDB) ToDurableLink() DurableLink {
